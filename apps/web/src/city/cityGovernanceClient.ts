@@ -6,18 +6,27 @@ export type CityProject = {
   placements?: Array<{ kind: CityDecoration['kind']; x: number; z: number }>;
   road?: { x: number; z: number; width: number; depth: number };
 };
+export type CityPersonalBlock = {
+  id: string; name: string; areaId: string | null; description: string; cost: number;
+  placements: Array<{ plotId: string; decorationId: string }>;
+};
 export type CityConfig = {
   schemaVersion: number; version: string; projects: CityProject[];
   personalPlots: Array<{ id: string; name: string; x: number; z: number; options: string[] }>;
   personalAreas?: Array<{ id: string; name: string; plotIds: string[] }>;
+  personalBlocks?: CityPersonalBlock[];
   decorations: CityDecoration[]; initialBuiltBuildingIds: string[];
 };
 export type CityState = {
   epoch: string; revision: number; configVersion: string;
-  projects: Array<{ id: string; funded: number; built: boolean }>;
+  projects: Array<{ id: string; funded: number; built: boolean; votes?: number }>;
   decorations: Array<{ plotId: string; decorationId: string; ownerId: string; ownerNickname: string }>;
 };
+type CityStateWithVotes = Omit<CityState, 'projects'> & {
+  projects: Array<CityState['projects'][number] & { votes: number }>;
+};
 import { townApiUrl } from '../core/townApi';
+import { getResidentToken } from '../core/residentToken';
 
 // This module is the existing browser transport facade, including safe error
 // adaptation. Pure gameplay rules do not depend on this HTTP/storage boundary.
@@ -40,6 +49,8 @@ type MutationSession = { generation: symbol; token: string | null; requests: Map
 let mutationSession: MutationSession | null = null;
 let config: CityConfig | null = null;
 let state: CityState | null = null;
+const pendingBuildings = new Set<string>();
+const trustedBuiltBuildings = new Set<string>();
 let loadSequence = 0;
 let activeLoad: Promise<void> | null = null;
 let activeSignal: AbortSignal | undefined;
@@ -52,12 +63,36 @@ function cachedConfig(): CityConfig | null {
   } catch { return null; }
 }
 
-function notify() { listeners.forEach((listener) => listener(config, state)); }
+function notify() {
+  if (config && state?.configVersion === config.version) {
+    const builtProjects = new Set(state.projects.filter((project) => project.built).map((project) => project.id));
+    const initialBuildings = new Set(config.initialBuiltBuildingIds);
+    pendingBuildings.clear();
+    trustedBuiltBuildings.clear();
+    initialBuildings.forEach((id) => trustedBuiltBuildings.add(id));
+    for (const project of config.projects) {
+      if (!project.buildingId) continue;
+      if (initialBuildings.has(project.buildingId) || builtProjects.has(project.id)) trustedBuiltBuildings.add(project.buildingId);
+      else pendingBuildings.add(project.buildingId);
+    }
+  } else if (config) {
+    // While the new snapshot is unavailable, keep known construction outcomes
+    // and hide new project buildings until the server confirms completion.
+    const initialBuildings = new Set(config.initialBuiltBuildingIds);
+    // The current config may promote a formerly pending project to an initial
+    // building, which no longer needs a matching project progress row.
+    initialBuildings.forEach((id) => pendingBuildings.delete(id));
+    for (const project of config.projects) {
+      if (project.buildingId && !initialBuildings.has(project.buildingId) && !trustedBuiltBuildings.has(project.buildingId)) pendingBuildings.add(project.buildingId);
+    }
+  }
+  listeners.forEach((listener) => listener(config, state));
+}
 
 // The multiplayer adapter calls this after authentication changes. Reading the
 // token here also detects changes made in another tab before a mutation/reply.
 export function refreshCityGovernanceSession(): symbol {
-  const token = localStorage.getItem('minicityServerToken');
+  const token = getResidentToken();
   if (!mutationSession || mutationSession.token !== token) {
     const requests = (token && pendingRequestsByToken.get(token)) || new Map<string, PendingOperation>();
     if (token) pendingRequestsByToken.set(token, requests);
@@ -73,10 +108,26 @@ function isCurrentSession(session: MutationSession): boolean {
   return refreshCityGovernanceSession() === session.generation;
 }
 
-function validState(value: unknown): value is CityState {
+function validCityState(value: unknown, allowMissingVoteCounts: boolean): value is CityState {
   const item = value as Partial<CityState> | null;
   return Boolean(item && typeof item.epoch === 'string' && Number.isSafeInteger(item.revision)
-    && typeof item.configVersion === 'string' && Array.isArray(item.projects) && Array.isArray(item.decorations));
+    && typeof item.configVersion === 'string' && Array.isArray(item.projects)
+    && item.projects.every((project) => project && typeof project.id === 'string'
+      && Number.isSafeInteger(project.funded) && project.funded >= 0 && typeof project.built === 'boolean'
+      && ((allowMissingVoteCounts && !Object.hasOwn(project, 'votes'))
+        || (typeof project.votes === 'number' && Number.isSafeInteger(project.votes) && project.votes >= 0)))
+    && Array.isArray(item.decorations));
+}
+
+export function validState(value: unknown): value is CityStateWithVotes {
+  return validCityState(value, false);
+}
+
+// The frontend and server deploy independently. Older snapshots have no vote
+// counts; keep those unknown, and reject explicitly malformed counts.
+// Voting acknowledgements still use validState directly before releasing IDs.
+function readCityState(value: unknown): CityState | null {
+  return validCityState(value, true) ? value : null;
 }
 
 function isOlderCityState(next: CityState): boolean {
@@ -93,6 +144,7 @@ async function fetchJson(path: string, signal?: AbortSignal, init?: RequestInit)
 
 export function getCityConfig(): CityConfig | null { return config; }
 export function getCityState(): CityState | null { return state; }
+export function isCityGovernanceLoading(): boolean { return activeLoad !== null; }
 
 export function loadCityGovernance(signal?: AbortSignal): Promise<void> {
   if (activeLoad && !activeSignal?.aborted) return activeLoad;
@@ -115,11 +167,13 @@ export function loadCityGovernance(signal?: AbortSignal): Promise<void> {
       if (!nextConfig?.version) throw new Error('City configuration unavailable');
       if (sequence !== loadSequence) return;
       config = nextConfig;
+      if (state?.configVersion !== config.version) state = null;
+      notify();
       stateBeforeFetch = state;
       const stateResponse = await fetchJson('/town-api/city/state', signal, { cache: 'no-store' });
-      const nextState: unknown = stateResponse.ok ? await stateResponse.json() : null;
+      const nextState = readCityState(stateResponse.ok ? await stateResponse.json() : null);
       if (sequence !== loadSequence) return;
-      if (validState(nextState) && nextState.configVersion === config.version) {
+      if (nextState && nextState.configVersion === config.version) {
         // A WS update can arrive while this HTTP snapshot is in flight.
         if (!isOlderCityState(nextState)) state = nextState;
       } else if (state === stateBeforeFetch) state = null;
@@ -142,6 +196,9 @@ export function loadCityGovernance(signal?: AbortSignal): Promise<void> {
       }
     }
   })();
+  // Publish only after assigning the promise: subscribers may request the same
+  // load, and a trailing refresh must stay loading throughout its notification.
+  notify();
   return activeLoad;
 }
 
@@ -161,8 +218,9 @@ export function subscribeCityGovernance(listener: CityGovernanceListener): () =>
   return () => listeners.delete(listener);
 }
 
-export function applyCityState(next: unknown): boolean {
-  if (!validState(next)) return false;
+export function applyCityState(value: unknown): boolean {
+  const next = readCityState(value);
+  if (!next) return false;
   if (!config || next.configVersion !== config.version) { state = null; void loadCityGovernance(); notify(); return false; }
   if (isOlderCityState(next)) return false;
   state = next;
@@ -171,12 +229,10 @@ export function applyCityState(next: unknown): boolean {
 }
 
 export function isConstructionPending(buildingId: string): boolean {
-  // Keep the regular city usable while the optional governance service is unavailable.
-  if (!config || !state || state.configVersion !== config.version) return false;
-  if (config.initialBuiltBuildingIds.includes(buildingId)) return false;
-  const project = config.projects.find((item) => item.buildingId === buildingId);
-  if (!project) return false;
-  return !state.projects.some((item) => item.id === project.id && item.built);
+  // Before any configuration the optional service has no policy. Reloads keep
+  // trusted outcomes and hide newly configured projects until a matching state
+  // arrives, including when the state request fails.
+  return pendingBuildings.has(buildingId);
 }
 
 export function disposeCityGovernance(): void {
@@ -186,13 +242,15 @@ export function disposeCityGovernance(): void {
   refreshAfterLoad = false;
   config = null;
   state = null;
+  pendingBuildings.clear();
+  trustedBuiltBuildings.clear();
   mutationSession = null;
   pendingRequestsByToken.clear();
   listeners.clear();
 }
 
 function cityOperationKey(path: string, body: Record<string, unknown>): string {
-  const target = body.areaId !== undefined ? ['areaId', body.areaId]
+  const target = body.blockId !== undefined ? ['blockId', body.blockId]
     : body.projectId !== undefined ? ['projectId', body.projectId] : ['plotId', body.plotId];
   return `${path}:${JSON.stringify(target)}`;
 }
@@ -211,18 +269,15 @@ async function mutate(path: string, body: Record<string, unknown>): Promise<City
   // after an uncertain outcome, even if the current catalog changes before retry.
   const retained = pendingRequestIds.get(operationKey);
   if (retained && JSON.stringify(retained.body) !== JSON.stringify(body)) {
-    // A changed amount/decoration is a new payment, not a retry. Resolve the
-    // target's uncertain operation before accepting another set of parameters.
-    if (retained.body.areaId !== undefined) {
-      throw new Error('该区域上一笔建设结果仍待确认，请先按原装饰和数量重试。');
-    }
+    // A changed amount is a new payment, not a retry. Resolve the target's
+    // uncertain operation before accepting another set of parameters.
+    // Block purchases have no free parameters: same block, same body.
     if (retained.body.projectId !== undefined) {
       const project = config.projects.find((entry) => entry.id === retained.body.projectId);
       throw new Error(`${project ? `「${project.name}」` : '该项目'}上一笔 ${retained.body.amount} 金币捐款结果尚未确认，请恢复原金额重试，确认结果后再修改。`);
     }
-    const plot = config.personalPlots.find((entry) => entry.id === retained.body.plotId);
-    const decoration = config.decorations.find((entry) => entry.id === retained.body.decorationId);
-    throw new Error(`${plot ? `「${plot.name}」` : '这块地'}上一笔「${decoration?.name ?? retained.body.decorationId}」建设结果尚未确认，请恢复原装饰重试，确认结果后再修改。`);
+    const block = config.personalBlocks?.find((entry) => entry.id === retained.body.blockId);
+    throw new Error(`${block ? `「${block.name}」` : '该小区块'}上一笔投建结果尚未确认，请先重试确认后再继续。`);
   }
   const operation = retained
     ?? { requestId: makeRequestId(), configVersion: config.version, body: { ...body } };
@@ -251,36 +306,30 @@ async function mutate(path: string, body: Record<string, unknown>): Promise<City
   if (response.status === 401) window.dispatchEvent(new CustomEvent('minicity:login-required'));
   // Report the rejected operation immediately; a slow refresh must not hide it.
   if (response.status === 409) refreshCityGovernance();
-  if (!response.ok || !validState(payload.state)) {
+  const confirmedState = readCityState(payload.state);
+  if (!response.ok || !confirmedState) {
     if (isDefinitiveRejection(response, payload.error) && pendingRequestIds.get(operationKey) === operation) {
       pendingRequestIds.delete(operationKey);
     }
     throw new Error(cityOperationError(payload.error));
   }
   if (pendingRequestIds.get(operationKey) === operation) pendingRequestIds.delete(operationKey);
-  applyCityState(payload.state);
-  return { state: payload.state, replayed: payload.replayed === true };
+  applyCityState(confirmedState);
+  return { state: confirmedState, replayed: payload.replayed === true };
 }
 
 // These keys are the city HttpBodyError contract. Keep them aligned with
 // cityGovernance.ts and cityGovernanceRouter.ts; the integration suite checks it.
 const cityOperationMessages: Record<string, string> = {
-  'Unknown construction area': '建设区域不存在，请刷新后重试。',
-  'No available plots in this area': '该区域已全部建设，请选择其他区域。',
-  'Not enough available plots in this area': '该区域空地不足，请减少数量或选择其他区域。',
-  'Quantity must be an integer between 1 and 100; choose one area': '请选择一个区域，并输入 1–100 之间的整数数量。',
-  'Quantity requires an area': '请先选择批量建设区域。',
-  'Invalid decoration total': '建设总价无效，请重新选择数量。',
+  'Unknown construction block': '该小区块不存在，请刷新后重试。',
+  'Block plot already occupied': '该小区块的部分地块已有装饰，暂时无法整块投建。',
+  'Personal decorations are sold as complete blocks': '个人装饰以小区块整体投建，请在小区块列表中选择一片。',
   'Invalid requestId': '建设请求无效，请刷新页面后重试。',
   'Invalid configVersion': '建设配置无效，请刷新页面后重试。',
-  'Invalid target': '建设目标无效，请重新选择项目或地块。',
-  'Invalid decorationId': '装饰类型无效，请重新选择后重试。',
+  'Invalid target': '建设目标无效，请重新选择项目或小区块。',
   'requestId already used with different parameters': '这次建设请求参数已变化，请重新提交当前内容。',
-  'Decoration is not allowed on this plot': '这块地不支持当前装饰，请选择其他装饰。',
   'Unknown project': '建设项目不存在，请刷新页面后重试。',
-  'Unknown plot or decoration': '地块或装饰不存在，请刷新页面后重试。',
   'Insufficient currency': '金币不足，无法完成建设或捐款。请获得更多金币后重试。',
-  'Plot already occupied': '这块地已被建设，请选择其他空地。',
   'Project already built': '该项目已建成，请选择其他建设项目。',
   'City config changed; reload config': '建设配置已更新，请确认最新信息后重试。',
   'Amount must be a positive safe integer': '请输入大于 0 的整数捐款金额。',
@@ -312,15 +361,13 @@ function cityOperationError(error?: string): string {
   return '建设请求失败，请稍后重试。';
 }
 
-function makeRequestId() { return `city-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`; }
+export function makeRequestId() {
+  const uuid = globalThis.crypto?.randomUUID?.();
+  return `city-${uuid ?? `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`}`;
+}
 export function donateCity(projectId: string, amount: number) { return mutate('/town-api/city/donate', { projectId, amount }); }
-export function decorateCity(plotId: string, decorationId: string) { return mutate('/town-api/city/decorate', { plotId, decorationId }); }
-export function decorateCityArea(areaId: string, decorationId: string, quantity: number) { return mutate('/town-api/city/decorate', { areaId, decorationId, quantity }); }
-export function getPendingCityAreaOperation(areaId: string): { decorationId: string; quantity: number } | null {
+export function decorateCityBlock(blockId: string) { return mutate('/town-api/city/decorate', { blockId }); }
+export function getPendingCityBlockOperation(blockId: string): boolean {
   refreshCityGovernanceSession();
-  const operation = mutationSession?.requests.get(cityOperationKey('/town-api/city/decorate', { areaId }));
-  if (operation && typeof operation.body.decorationId === 'string' && typeof operation.body.quantity === 'number') {
-    return { decorationId: operation.body.decorationId, quantity: operation.body.quantity };
-  }
-  return null;
+  return mutationSession?.requests.has(cityOperationKey('/town-api/city/decorate', { blockId })) ?? false;
 }
