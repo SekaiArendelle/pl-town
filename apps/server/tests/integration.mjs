@@ -291,10 +291,12 @@ const waitForClose = (client) => new Promise((resolve, reject) => {
   client.socket.once('close', () => { clearTimeout(timeout); resolve(); });
 });
 
-const waitFor = (client, type, predicate = () => true) => {
+const waitFor = (client, type, predicate = () => true, since = 0) => {
   const callSite = new Error().stack?.split('\n')[2]?.trim() ?? 'unknown';
   return new Promise((resolve, reject) => {
-    const existing = client.messages.find((message) => message.type === type && predicate(message));
+    // `since` scopes the history scan to messages after a recorded index so a
+    // repeated action never matches the response of an earlier identical one.
+    const existing = client.messages.slice(Math.max(0, since)).find((message) => message.type === type && predicate(message));
     if (existing) return resolve(existing);
     const timeout = setTimeout(() => { writeFileSync(join(tmpdir(), 'server-startup-dump.log'), serverStartupOutput); reject(new Error(`Timed out waiting for ${type} (client=${client.hello?.user?.nickname ?? 'unknown'}, recent=[${client.messages.slice(-4).map((message) => `${message.type}:${message.message ?? message.event?.type ?? ''}`).join(' | ')}], called=${callSite})`)); }, 15_000);
     const listener = (raw) => {
@@ -795,7 +797,204 @@ try {
   send(aliceAgain, { type: 'story.get', storyId: 'sample-story' });
   const restoredStory = await waitFor(aliceAgain, 'story.updated', (message) => message.event?.type === 'story.loaded' && message.story?.storyId === 'sample-story');
   if (restoredStory.story.definitionVersion !== 3 || restoredStory.story.nodeId !== 'first-signal' || restoredStory.story.ending !== 'reconciled' || restoredStory.story.visitCount !== 1 || restoredStory.story.flags.heardWhisper !== false || restoredStory.story.flags.signalCount !== 1) throw new Error('Story progress must survive reconnecting');
-  aliceAgain.socket.close();
+
+  const marketCatalog = alice.hello.catalog;
+  if (marketCatalog.store?.dayKey !== alice.hello.progress.daily?.dayKey || marketCatalog.dailyMissions?.length !== 2) throw new Error('Market catalog must provide the Shanghai day, daily missions, and rotating offer');
+  send(aliceAgain, { type: 'progress.daily.checkin' });
+  const checkIn = await waitFor(aliceAgain, 'progress.updated', (message) => message.event?.type === 'daily.checkin' && message.event.claimed === true);
+  if (checkIn.event.reward !== 40 || checkIn.event.streak !== 1 || checkIn.progress.currency !== 1200 || !checkIn.progress.daily.checkInClaimed) throw new Error('First daily check-in must grant its server-owned reward exactly once');
+  send(aliceAgain, { type: 'progress.daily.checkin' });
+  const repeatedCheckIn = await waitFor(aliceAgain, 'progress.updated', (message) => message.event?.type === 'daily.checkin' && message.event.claimed === false);
+  if (repeatedCheckIn.event.reward !== 0 || repeatedCheckIn.progress.currency !== 1200) throw new Error('A repeated check-in must not grant currency twice');
+  send(aliceAgain, { type: 'progress.daily.mission.claim', missionId: 'market_walk_6' });
+  const incompleteMission = await waitFor(aliceAgain, 'progress.updated', (message) => message.event?.type === 'daily.mission.claimed' && message.event.missionId === 'market_walk_6');
+  if (incompleteMission.event.claimed !== false || incompleteMission.progress.currency !== 1200) throw new Error('The server must reject daily mission claims before their visit target is reached');
+  send(aliceAgain, { type: 'progress.daily.mission.claim', missionId: 'market_walk_3' });
+  const mission = await waitFor(aliceAgain, 'progress.updated', (message) => message.event?.type === 'daily.mission.claimed' && message.event.missionId === 'market_walk_3' && message.event.claimed === true);
+  if (mission.event.reward !== 35 || mission.progress.currency !== 1235 || mission.progress.daily.visitedBuildings.length < 3) throw new Error('Visiting three distinct buildings must unlock the daily exploration reward');
+  send(aliceAgain, { type: 'progress.daily.mission.claim', missionId: 'market_walk_3' });
+  const repeatedMission = await waitFor(aliceAgain, 'progress.updated', (message) => message.event?.type === 'daily.mission.claimed' && message.event.missionId === 'market_walk_3' && message.event.claimed === false);
+  if (repeatedMission.progress.currency !== 1235) throw new Error('A daily mission reward must be idempotent');
+  const featuredId = marketCatalog.store.featuredProductId;
+  const featuredProduct = marketCatalog.products[featuredId];
+  const featuredUnitPrice = Math.max(1, Math.floor(featuredProduct.unitPrice * (100 - marketCatalog.store.discountPercent) / 100));
+  send(aliceAgain, { type: 'progress.shop.buy', productId: featuredId, quantity: 2, dealDay: marketCatalog.store.dayKey });
+  const featuredPurchase = await waitFor(aliceAgain, 'progress.updated', (message) => message.event?.type === 'shop.purchased' && message.event.productId === featuredId);
+  if (featuredPurchase.event.pricePaid !== featuredUnitPrice * 2 || featuredPurchase.event.featured !== true || featuredPurchase.progress.currency !== 1235 - featuredUnitPrice * 2) throw new Error('The current featured offer must apply its server-calculated discount to bulk purchases');
+  send(aliceAgain, { type: 'progress.shop.buy', productId: featuredId, quantity: 1, dealDay: '2000-01-01' });
+  const expiredDealPurchase = await waitFor(aliceAgain, 'progress.updated', (message) => message.event?.type === 'shop.purchased' && message.event.productId === featuredId && message.event.quantity === 1);
+  if (expiredDealPurchase.event.featured !== false || expiredDealPurchase.event.pricePaid !== featuredProduct.unitPrice) throw new Error('Expired featured deals must fall back to the regular server price');
+
+  // 市集交易：合成、供货订单与托管挂单。所有断言基于消息前后的余额/库存差值，
+  // 不依赖当日特惠或供货轮换的具体商品。trader 复用 aliceAgain 连接、买家复用
+  // 一直在线的 charlie：认证限流为每 IP 60 秒 20 次，新增连接会把配额打爆。
+  const trader = aliceAgain;
+  const traderBaseSince = trader.messages.length;
+  send(trader, { type: 'progress.get' });
+  const traderBase = await waitFor(trader, 'progress.updated', (item) => !item.event, traderBaseSince);
+  const tradeCatalog = traderBase.catalog;
+  if (!tradeCatalog.recipes?.length || !tradeCatalog.dailySupplyOrder?.id || !tradeCatalog.tradeableItemIds?.includes('radish')) throw new Error('Market catalog must expose recipes, the daily supply order, and tradeable items');
+  let traderInventory = traderBase.progress.inventory;
+  let traderCurrency = traderBase.progress.currency;
+  const trackTrader = (message) => { traderInventory = message.progress.inventory; traderCurrency = message.progress.currency; };
+  const consumeAll = async (itemId) => {
+    const owned = traderInventory[itemId] ?? 0;
+    if (!owned) return;
+    const since = trader.messages.length;
+    send(trader, { type: 'progress.item.consume', itemId, quantity: owned });
+    const message = await waitFor(trader, 'progress.updated', (item) => item.event?.type === 'item.consumed' && item.event.itemId === itemId, since);
+    trackTrader(message);
+  };
+  const buyUnits = async (productId, quantity) => {
+    const since = trader.messages.length;
+    send(trader, { type: 'progress.shop.buy', productId, quantity });
+    const message = await waitFor(trader, 'progress.updated', (item) => item.event?.type === 'shop.purchased' && item.event.productId === productId && item.event.quantity === quantity, since);
+    trackTrader(message);
+  };
+  const craftOnce = async (recipeId) => {
+    const since = trader.messages.length;
+    send(trader, { type: 'market.recipe.craft', recipeId });
+    const message = await waitFor(trader, 'progress.updated', (item) => item.event?.type === 'market.crafted' && item.event.recipeId === recipeId, since);
+    trackTrader(message);
+    return message;
+  };
+  const stockFor = async (itemId, needed, depth = 0) => {
+    if (depth > 3) throw new Error(`Market test prep for ${itemId} recursed too deep`);
+    while ((traderInventory[itemId] ?? 0) < needed) {
+      if (tradeCatalog.products[itemId]) await buyUnits(itemId, needed - (traderInventory[itemId] ?? 0));
+      else {
+        const recipe = tradeCatalog.recipes?.find((entry) => entry.output.itemId === itemId);
+        if (!recipe) throw new Error(`No shop product or recipe can produce ${itemId}`);
+        for (const ingredient of recipe.ingredients) await stockFor(ingredient.itemId, ingredient.quantity * needed, depth + 1);
+        await craftOnce(recipe.id);
+      }
+    }
+  };
+  const sinceMessage = (client, type, predicate, since) => waitFor(client, type, predicate, since);
+
+  // 合成：清空食材后按配方买料、合成，产出进入背包且食材被扣除
+  await consumeAll('beef');
+  await consumeAll('radish');
+  await buyUnits('beef', 1);
+  await buyUnits('radish', 2);
+  const sharedMealBefore = traderInventory.shared_meal ?? 0;
+  await craftOnce('shared_meal');
+  if ((traderInventory.beef ?? 0) !== 0 || (traderInventory.radish ?? 0) !== 0 || traderInventory.shared_meal !== sharedMealBefore + 1) throw new Error('Crafting must consume its recipe ingredients and add the output to the inventory');
+  const craftFailSince = trader.messages.length;
+  send(trader, { type: 'market.recipe.craft', recipeId: 'shared_meal' });
+  const craftFailure = await sinceMessage(trader, 'error', (item) => item.message === 'Ingredient is not available', craftFailSince);
+  if (!craftFailure) throw new Error('Crafting without ingredients must be rejected by the server');
+
+  // 供货订单：按今日订单备货、交付得赏金，重复交付幂等
+  const order = tradeCatalog.dailySupplyOrder;
+  for (const requirement of order.requirements) await stockFor(requirement.itemId, requirement.quantity);
+  const currencyBeforeOrder = traderCurrency;
+  send(trader, { type: 'market.supply.fulfill', orderId: order.id });
+  const fulfilledOrder = await waitFor(trader, 'progress.updated', (item) => item.event?.type === 'market.order.fulfilled' && item.event.orderId === order.id && item.event.fulfilled === true);
+  if (fulfilledOrder.event.reward !== order.reward || fulfilledOrder.progress.currency !== currencyBeforeOrder + order.reward || !fulfilledOrder.progress.daily.fulfilledOrders.includes(order.id)) throw new Error('Delivering the daily supply order must grant its server-owned reward exactly once');
+  send(trader, { type: 'market.supply.fulfill', orderId: order.id });
+  const repeatedOrder = await waitFor(trader, 'progress.updated', (item) => item.event?.type === 'market.order.fulfilled' && item.event.orderId === order.id && item.event.fulfilled === false);
+  if (repeatedOrder.progress.currency !== currencyBeforeOrder + order.reward) throw new Error('A supply order must pay out once per day');
+
+  // 挂单：上架即托管（库存扣减），他人购买后按单价×数量结算，下架退回物品
+  await stockFor('radish', 2);
+  const radishEscrowBefore = traderInventory.radish ?? 0;
+  const currencyBeforeListing = traderCurrency;
+  const createSince = trader.messages.length;
+  send(trader, { type: 'market.listing.create', itemId: 'radish', quantity: 2, price: 77 });
+  const createdListing = await waitFor(trader, 'progress.updated', (item) => item.event?.type === 'market.listing.created', createSince);
+  trackTrader(createdListing);
+  const listingId = createdListing.event.listingId;
+  if (!listingId || (traderInventory.radish ?? 0) !== radishEscrowBefore - 2) throw new Error('Creating a listing must escrow the items out of the seller inventory');
+  const boardAfterCreate = await waitFor(trader, 'market.listings', (item) => item.listings?.active?.some((entry) => entry.id === listingId && entry.price === 77 && entry.sellerNickname === 'Alice'));
+  if (!boardAfterCreate) throw new Error('The escrow board must broadcast the new listing');
+
+  const nonTradeableSince = trader.messages.length;
+  send(trader, { type: 'market.listing.create', itemId: 'city_guide', quantity: 1, price: 10 });
+  const nonTradeable = await sinceMessage(trader, 'error', (item) => item.message === 'This item cannot be listed', nonTradeableSince);
+  if (!nonTradeable) throw new Error('Non-tradeable items must be refused by the listing API');
+
+  const selfBuySince = trader.messages.length;
+  send(trader, { type: 'market.listing.buy', listingId });
+  const selfBuy = await sinceMessage(trader, 'error', (item) => item.message === 'You cannot buy your own listing', selfBuySince);
+  if (!selfBuy) throw new Error('Residents must not buy their own listing');
+
+  const buyer = charlie;
+  const buyerBaseSince = buyer.messages.length;
+  send(buyer, { type: 'progress.get' });
+  const buyerBaseline = await waitFor(buyer, 'progress.updated', (item) => !item.event, buyerBaseSince);
+  const buyerInventoryBefore = buyerBaseline.progress.inventory;
+  const buyerListingsGet = buyer.messages.length;
+  send(buyer, { type: 'market.listings.get' });
+  await waitFor(buyer, 'market.listings', (item) => item.listings?.active?.some((entry) => entry.id === listingId), buyerListingsGet);
+  const buySince = buyer.messages.length;
+  send(buyer, { type: 'market.listing.buy', listingId });
+  const listingPurchase = await waitFor(buyer, 'progress.updated', (item) => item.event?.type === 'market.listing.sold' && item.event.listingId === listingId, buySince);
+  if (listingPurchase.progress.currency !== buyerBaseline.progress.currency - 154 || (listingPurchase.progress.inventory.radish ?? 0) !== (buyerInventoryBefore.radish ?? 0) + 2) throw new Error('Buying a listing must move the escrowed items and the unit-price-times-quantity total to the buyer');
+  await waitFor(trader, 'market.listings', (item) => item.listings?.own?.some((entry) => entry.id === listingId && entry.status === 'sold'));
+  const payoutSince = trader.messages.length;
+  send(trader, { type: 'progress.get' });
+  const payout = await waitFor(trader, 'progress.updated', (item) => !item.event, payoutSince);
+  if (payout.progress.currency !== currencyBeforeListing + 154) throw new Error('The seller must receive the full unit-price-times-quantity payout when the escrow settles');
+
+  // 买不起的挂单：服务端拒绝且托管不变
+  await stockFor('radish', 1);
+  const unaffordableSince = trader.messages.length;
+  send(trader, { type: 'market.listing.create', itemId: 'radish', quantity: 1, price: 9999 });
+  const unaffordableListing = await waitFor(trader, 'progress.updated', (item) => item.event?.type === 'market.listing.created', unaffordableSince);
+  trackTrader(unaffordableListing);
+  const unaffordableId = unaffordableListing.event.listingId;
+  const poorBuySince = buyer.messages.length;
+  send(buyer, { type: 'market.listing.buy', listingId: unaffordableId });
+  const poorBuy = await sinceMessage(buyer, 'error', (item) => item.message === 'Insufficient currency', poorBuySince);
+  if (!poorBuy) throw new Error('A buyer without enough currency must be refused before the escrow settles');
+  const cancelSince = trader.messages.length;
+  send(trader, { type: 'market.listing.cancel', listingId: unaffordableId });
+  await waitFor(trader, 'progress.updated', (item) => item.event?.type === 'market.listing.cancelled' && item.event.listingId === unaffordableId, cancelSince);
+  const refundSince = trader.messages.length;
+  send(trader, { type: 'progress.get' });
+  const refund = await waitFor(trader, 'progress.updated', (item) => !item.event, refundSince);
+  if ((refund.progress.inventory.radish ?? 0) !== (traderInventory.radish ?? 0) + 1) throw new Error('Cancelling a listing must return the escrowed items to the seller');
+  traderInventory = refund.progress.inventory;
+
+  // 合成品也是可交易物品：crafted output 分支（RECIPE_OUTPUT_ITEM_IDS）
+  await stockFor('shared_meal', 1);
+  const craftedEscrowBefore = traderInventory.shared_meal ?? 0;
+  const craftedSince = trader.messages.length;
+  send(trader, { type: 'market.listing.create', itemId: 'shared_meal', quantity: 1, price: 30 });
+  const craftedListing = await waitFor(trader, 'progress.updated', (item) => item.event?.type === 'market.listing.created', craftedSince);
+  trackTrader(craftedListing);
+  if ((traderInventory.shared_meal ?? 0) !== craftedEscrowBefore - 1) throw new Error('Crafted goods must be escrowed like any other tradeable item');
+  const craftedCancelSince = trader.messages.length;
+  send(trader, { type: 'market.listing.cancel', listingId: craftedListing.event.listingId });
+  const craftedRefund = await waitFor(trader, 'progress.updated', (item) => item.event?.type === 'market.listing.cancelled' && item.event.listingId === craftedListing.event.listingId, craftedCancelSince);
+  trackTrader(craftedRefund);
+  if ((traderInventory.shared_meal ?? 0) !== craftedEscrowBefore) throw new Error('Cancelling must return the crafted good to the seller');
+
+  // 每人在售挂单上限：第 7 个创建必须被拒绝
+  await stockFor('radish', 6);
+  const capIds = [];
+  for (let index = 0; index < 6; index++) {
+    const since = trader.messages.length;
+    send(trader, { type: 'market.listing.create', itemId: 'radish', quantity: 1, price: 1 });
+    const created = await waitFor(trader, 'progress.updated', (item) => item.event?.type === 'market.listing.created', since);
+    trackTrader(created);
+    capIds.push(created.event.listingId);
+  }
+  const capRejectSince = trader.messages.length;
+  send(trader, { type: 'market.listing.create', itemId: 'radish', quantity: 1, price: 1 });
+  const capReject = await sinceMessage(trader, 'error', (item) => item.message === 'Too many active listings', capRejectSince);
+  if (!capReject) throw new Error('The seventh active listing must be refused by the server');
+  const capRefundBefore = traderInventory.radish ?? 0;
+  for (const id of capIds) {
+    const since = trader.messages.length;
+    send(trader, { type: 'market.listing.cancel', listingId: id });
+    await waitFor(trader, 'progress.updated', (item) => item.event?.type === 'market.listing.cancelled' && item.event.listingId === id, since);
+  }
+  const capRefundSince = trader.messages.length;
+  send(trader, { type: 'progress.get' });
+  const capRefund = await waitFor(trader, 'progress.updated', (item) => !item.event, capRefundSince);
+  if ((capRefund.progress.inventory.radish ?? 0) !== capRefundBefore + 6) throw new Error('Cancelling every capped listing must return all six escrowed radishes');
 
   const disableCharlie = await fetch(`${adminBase}/users/${charlie.hello.user.id}/status`, {
     method: 'PATCH', headers: { cookie, origin: adminOrigin, 'content-type': 'application/json', 'x-csrf-token': loginPayload.csrf },
@@ -842,6 +1041,7 @@ try {
 
   // Shop catalog: admin edits must persist, broadcast, and price purchases live.
   const shopClient = await connect('Alice');
+  if (!shopClient.hello.progress.daily.checkInClaimed || !shopClient.hello.progress.daily.claimedMissions.includes('market_walk_3')) throw new Error('Daily check-in and mission claims must survive reconnecting');
   const shopWorldState = await fetch(`${adminBase}/world`, { headers: { cookie } });
   const shopWorldStatePayload = await shopWorldState.json();
   if (!shopWorldState.ok || shopWorldStatePayload.shop?.length !== 4 || shopWorldStatePayload.shop.find((product) => product.itemId === 'beef')?.unitPrice !== 45) throw new Error('Admin world GET must return the default shop catalog');
