@@ -30,6 +30,19 @@ export type AnimatedWaterConfig = {
   /** Mirror render-target resolution; small surfaces can use a tiny target. */
   textureWidth?: number;
   textureHeight?: number;
+  /** Optional near-shore color blend for the sea surface. The open sea stays
+   *  deep and opaque; from tens of world units offshore the color eases toward
+   *  a lighter aqua so the shallows read as lit-through water, with no visible
+   *  band edge. Displacement and transparency live on the caller's dedicated
+   *  surf strip (see westBeach.ts), not here: this mesh is large, coarse
+   *  (1.5 units per column) and double-rendered by the mirror pass, so it must
+   *  stay a single opaque, unmoved sheet. */
+  shoreBlend?: {
+    /** Ribbon span in world units covered by uv.x 0 → 1. */
+    ribbonDepth: number;
+    /** Distance from the waterline (world units) over which the blend fades. */
+    width: number;
+  };
   side?: THREE.Side;
   renderOrder?: number;
 };
@@ -41,6 +54,16 @@ export type AnimatedWaterSurface = {
 };
 
 let sharedWaterNormals: THREE.Texture | null = null;
+
+// Aqua the sea eases toward near the waterline, so the shallows read as
+// lit-through water without a glaring white rim. Authoring note: this must be
+// a *uniform lerped with the daylight clock*, not a shader literal — a literal
+// keeps shining at full brightness after dark while the rest of the sea dims.
+// It pairs with the surf strip in westBeach.ts: this band is deliberately
+// wider than the strip's seaward extent (SURF_SEAWARD there, `width` here),
+// so the strip's root fade always happens over already-tinted water.
+const SHALLOW_TINT_DAY = new THREE.Color(0x3f9fb5);
+const SHALLOW_TINT_NIGHT = new THREE.Color(0x123642);
 
 function getWaterNormals(): THREE.Texture {
   if (!sharedWaterNormals) {
@@ -182,6 +205,55 @@ export function createAnimatedWaterSurface(
       `vec3( ${glslFloat(config.reflectionBase ?? 0.08)} ) + reflectionSample * ${glslFloat(config.reflectionWeight ?? 0.45)} + reflectionSample * specularLight * ${glslFloat(config.specularScale ?? 1)}`,
     );
   material.needsUpdate = true;
+  if (config.shoreBlend) {
+    // Near-shore shallow tint, measured in world units rather than uv so the
+    // band keeps its width no matter how deep the ribbon geometry runs. The
+    // `time` uniform here is already time-scaled by the caller.
+    const ribbonDepth = glslFloat(config.shoreBlend.ribbonDepth);
+    const width = glslFloat(config.shoreBlend.width);
+    // The tint follows the daylight clock via the shoreTint uniform (lerped
+    // in update()); declaring it on the material pre-compile means the
+    // renderer picks it up like any ShaderMaterial uniform.
+    material.uniforms['shoreTint'] = { value: SHALLOW_TINT_DAY.clone() };
+    material.onBeforeCompile = (shader) => {
+      const vertexAnchor = 'void main() {';
+      const fragmentAnchor = 'gl_FragColor = vec4( outgoingLight, alpha );';
+      const patchedVertex = shader.vertexShader.replace(
+        vertexAnchor,
+        /* glsl */ `
+        varying float vShoreDist;
+        void main() {
+          vShoreDist = (1.0 - uv.x) * ${ribbonDepth};`,
+      );
+      const patchedFragment = shader.fragmentShader
+        .replace(
+          'void main() {',
+          /* glsl */ `
+          varying float vShoreDist;
+          uniform vec3 shoreTint;
+          void main() {`,
+        )
+        .replace(
+          fragmentAnchor,
+          /* glsl */ `
+          {
+            // Shallow-water tint: a long, gradual fade from the open sea to
+            // the waterline so the deep→shallow change never reads as a band
+            // or a hard line. Stays opaque — the sea floor and any offshore
+            // models (ships!) must not bleed through the deep sheet.
+            vec3 shallowTint = mix(waterColor, shoreTint, 0.55);
+            outgoingLight = mix(outgoingLight, shallowTint, (1.0 - smoothstep(0.0, ${width}, vShoreDist)) * 0.4);
+            gl_FragColor = vec4( outgoingLight, alpha );
+          }`,
+        );
+      if (patchedVertex === shader.vertexShader || patchedFragment === shader.fragmentShader) {
+        // A silent miss would ship half a feature; make it loud instead.
+        console.warn('[animatedWater] shoreBlend shader anchors not found — the shore tint was skipped.');
+      }
+      shader.vertexShader = patchedVertex;
+      shader.fragmentShader = patchedFragment;
+    };
+  }
   // Keep the marker the scene-interest-points dispose pass looks for.
   water.userData.dynamicMaterial = material;
 
@@ -203,6 +275,11 @@ export function createAnimatedWaterSurface(
       waterColor.copy(config.waterColorDay).lerp(config.waterColorNight, 1 - daylight);
       const sunColor = uniforms.sunColor!.value as THREE.Color;
       sunColor.copy(config.sunColorDay).lerp(config.sunColorNight, 1 - daylight);
+      // Only the shoreBlend sea carries the shallow tint; ponds never set it.
+      if (config.shoreBlend) {
+        const shoreTint = uniforms.shoreTint!.value as THREE.Color;
+        shoreTint.copy(SHALLOW_TINT_DAY).lerp(SHALLOW_TINT_NIGHT, 1 - daylight);
+      }
     },
     setDaylight(value, instant = false) {
       daylightTarget = value;
