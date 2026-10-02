@@ -1,6 +1,6 @@
 import { ACTIVITY_ENTRIES, type ActivityBackgroundKey, type ActivityEntry } from '../../city/data/activities';
 
-// 每个活动自行配置背景图；新增 backgroundKey 时在此登记资源。
+// Local placeholder artwork; replace these files with generated event artwork later.
 const ACTIVITY_BACKGROUND_URLS: Record<ActivityBackgroundKey, string> = {
   'star-voyage': new URL('../../assets/activities/star-voyage.svg', import.meta.url).href,
   'aurora-festival': new URL('../../assets/activities/aurora-festival.svg', import.meta.url).href,
